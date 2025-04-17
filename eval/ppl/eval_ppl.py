@@ -1,13 +1,108 @@
+import os
+import json
+import fcntl
+import random
+import pickle
 import argparse
 import datasets
 import gc
 import sys
 import torch
 import warnings
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+import transformers
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, PreTrainedTokenizer
 from tqdm import tqdm
+from typing import Literal
 from seer_attn import SeerAttnLlamaForCausalLM, SeerAttnQwen2ForCausalLM
-import os
+
+from proj_config import *
+
+def get_dataset(data_id: str, train_nsamples, seed, seqlen, tokenizer:PreTrainedTokenizer, model_id: str, test_only=False):
+    MODEL_ID2CACHE = {
+        m: {
+            d: {
+                t : f"{DATA_DIR}/cache/{m}-{d}-{t}.pkl"
+                for t in ["train", "test"]
+            } for d in ["wiki", "pg19", "c4"] 
+        } for m in ["qwen2.5-3b"]
+    }
+    if data_id == "pg19": assert test_only
+
+    def lookup_cache(m: str, t: Literal["test", "train"]):
+        cache = MODEL_ID2CACHE[model_id][data_id][t]
+        print(f"cache: {cache}")
+        if not os.path.exists(cache):
+            data = datasets.load_dataset(DATA_ID2PATH[data_id], split=t)
+            encd = tokenizer("\n\n".join(data['text']), return_tensors='pt')["input_ids"]
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            with open(cache, "wb") as f:
+                pickle.dump(encd, f)
+        else:
+            with open(cache, "rb") as f:
+                encd = pickle.load(f)
+        return encd
+    
+    print(f"Loading {data_id} tokenized with {model_id} ...")
+    testenc = lookup_cache(model_id, "test")
+    if test_only:
+        return None, testenc
+
+    random.seed(seed)
+    trainloader = []
+    trainenc = lookup_cache(model_id, "train")
+    for _ in range(train_nsamples):
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        trainloader.append(inp)
+    return trainloader, testenc
+
+
+def append_with_lock(filename: str, data: str):
+    with open(filename, "a") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(sys.stdout.fileno(), fcntl.LOCK_EX)
+        print(f">>> Writing to {filename} ...", flush=True)
+        fcntl.flock(sys.stdout.fileno(), fcntl.LOCK_UN)
+        f.write(f"{data}\n")
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+@torch.no_grad()
+def eval_ppl(
+    ppl_testenc: torch.Tensor,
+    model,
+    input_len=4096
+):
+    model_use_cache = model.config.use_cache
+    model.config.use_cache = False
+    nsamples = ppl_testenc.numel() // input_len
+    nlls = []
+
+    loss_fct = torch.nn.CrossEntropyLoss()
+    for i in tqdm(range(nsamples), desc="Eval ppl", unit="sample"):
+        # [bs, input_len]
+        batch = ppl_testenc[:, (i * input_len) : ((i + 1) * input_len)].to(model.device)
+        outputs = model.model(batch)
+        hidden_states = outputs[0]
+        # [bs, input_len, vocab_size]
+        logits = model.lm_head(hidden_states)
+        # [bs, input_len-1, vocab_size]
+        shift_logits = logits[:, :-1, :]
+        # [bs, input_len-1]
+        shift_labels = batch[:, 1:].to(model.lm_head.weight.device)
+        loss = loss_fct(
+            # [bs * (input_len-1), vocab_size]
+            shift_logits.view(-1, shift_logits.size(-1)),
+            # [bs * (input_len-1)]
+            shift_labels.view(-1),
+        )
+        neg_log_likelihood = loss.float() * input_len
+        nlls.append(neg_log_likelihood)
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * input_len)).item()
+    print(f"ppl: {ppl}")
+    model.config.use_cache = model_use_cache
+    return ppl
 
 
 def compute_perplexity(
@@ -15,18 +110,12 @@ def compute_perplexity(
     model, 
     tokenizer, 
     add_start_token: bool = True, 
-    device=None, 
     max_length=None, 
     sliding_window=256, 
     truncate=False, 
     hide_progress=False,
 ):
-    if device is not None:
-        assert device in ["gpu", "cpu", "cuda"], "device should be either gpu or cpu."
-        if device == "gpu":
-            device = "cuda"
-    else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
 
     if add_start_token:
         assert tokenizer.bos_token is not None, "Input model must have a BOS token"
@@ -80,7 +169,6 @@ def compute_perplexity(
             gc.collect()
             torch.cuda.empty_cache() 
 
-
             nlls.append(neg_log_likelihood)
             ppl = float(torch.exp(torch.stack(nlls).mean()).float().cpu())
             pbar.set_postfix(ppl=ppl)
@@ -96,67 +184,24 @@ def compute_perplexity(
 
 
 def main(args):
-    config = AutoConfig.from_pretrained(args.model)
-    base_dir = config.base_model
-    
-    tokenizer = AutoTokenizer.from_pretrained(
-        base_dir, 
-        trust_remote_code=True,
-    )
+    model_path = MODEL_ID2PATH[args.model]
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Dataset loading (same as original)
-    if args.tokenized:
-        try:
-            input_texts = datasets.load_from_disk(args.tokenized)
-        except:
-            input_texts = datasets.load_dataset(
-                args.tokenized, name=args.subset, split=args.split, 
-                trust_remote_code=True)
-    else:
-        input_texts = datasets.load_dataset(
-            args.dataset, name=args.subset, split=args.split, 
-            trust_remote_code=True)
-
-        def tokenize(example):
-            tokenized = tokenizer(
-                example[args.feature],
-                add_special_tokens=False,
-                truncation=False,
-                max_length=sys.maxsize,
-            )
-            example["input_ids"] = tokenized["input_ids"]
-            example["attention_mask"] = tokenized["attention_mask"]
-            example["tokenized_len"] = len(tokenized["input_ids"])
-            return example
-
-        input_texts = input_texts.map(tokenize)
-        if args.save_tokenized:
-            input_texts.save_to_disk(args.save_tokenized)
-            print(f"Saved tokenized dataset to {args.save_tokenized}")
-            return
-
-    if args.dataset_min_tokens:
-        input_texts = input_texts.filter(
-            lambda x: x["tokenized_len"] >= args.dataset_min_tokens)
-    if args.samples:
-        input_texts = input_texts[:args.samples]
-
-    tokens = [args.min_tokens]
-    while args.min_tokens < args.max_tokens:
-        point = tokens[-1] * 2
-        if point <= args.max_tokens:
-            tokens.append(point)
-        else:
-            break
+    _, testenc = get_dataset(
+        data_id=args.dataset,
+        train_nsamples=args.samples,
+        seed=args.seed,
+        seqlen=args.max_tokens,
+        tokenizer=tokenizer,
+        model_id=args.model,
+        test_only=True
+    )
 
     results = []
-    model_path = args.model
-    torch.cuda.empty_cache()
-    
     # Model loading with config parameters
-    if args.use_seer_attn:
-        if "llama" in base_dir.lower():
+    if args.use_seer:
+        if "llama" in model_path.lower():
             model = SeerAttnLlamaForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch.bfloat16,
@@ -167,7 +212,7 @@ def main(args):
                 seerattn_gate_type=args.gate_type,
                 seerattn_last_block_dense=False,
             )
-        elif "qwen" in base_dir.lower():
+        elif "qwen" in model_path.lower():
             model = SeerAttnQwen2ForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch.bfloat16,
@@ -185,12 +230,12 @@ def main(args):
             model_path,
             torch_dtype=torch.bfloat16,
             device_map='auto',
-            attn_implementation="flash_attention_2"
+            attn_implementation="flash_attention_2",
         )
 
-    result = []
-    for max_length in tokens:
-        if args.use_seer_attn:
+    for seqlen in args.length:
+        save_file = f"{args.save_dir}/{args.model}-{args.dataset}-{seqlen}.jsonl"
+        if args.use_seer:
             params = (args.threshold.split(",") if args.sparsity_method == 'threshold' 
                         else args.nz_ratios.split(","))
             for param_val in params:
@@ -199,45 +244,13 @@ def main(args):
                 else:
                     model.config.seerattn_nz_ratio = float(param_val)
                 
-                output = compute_perplexity(
-                    model=model, 
-                    tokenizer=tokenizer, 
-                    encodings=input_texts,
-                    add_start_token=tokenizer.bos_token is not None, 
-                    max_length=max_length,
-                    sliding_window=args.sliding_window, 
-                    truncate=args.truncate,
-                )
-                ppl = output['mean_perplexity']
-                sparsity = output['sparsity']
-                result_str = (f"{model_path}: {max_length}tokens | "
-                                f"{args.sparsity_method}={param_val} | "
-                                f"ppl={ppl:.2f} | density={sparsity:.2f}")
-                print(result_str)
-                result.append(result_str)
+                ppl = eval_ppl(testenc, model, seqlen)
+                param_str = args.nz_ratios if args.sparsity_method == 'threshold' else args.threshold
+                seer_tag = f"seer-{args.sparsity_method}-{param_str}"
+                append_with_lock(save_file, json.dumps({f"{seer_tag}": f"{ppl:.3f}", "seqlen": seqlen}))
         else:
-            output = compute_perplexity(
-                model=model, 
-                tokenizer=tokenizer, 
-                encodings=input_texts,
-                add_start_token=tokenizer.bos_token is not None, 
-                max_length=max_length,
-                sliding_window=args.sliding_window, 
-                truncate=args.truncate,
-            )
-            ppl = output['mean_perplexity']
-            result_str = f"{model_path}: {max_length}tokens | ppl={ppl:.2f}"
-            print(result_str)
-            result.append(result_str)
-
-    results.append(result)
-
-    # Save results (same as original)
-    if args.output_file:
-        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-        with open(args.output_file, "a") as f:
-            for result in results:
-                f.write("\n".join(result) + "\n")
+            ppl = eval_ppl(testenc, model, seqlen)
+            append_with_lock(save_file, json.dumps({f"full": f"{ppl:.3f}", "seqlen": seqlen}))
 
 
 if __name__ == "__main__":
@@ -245,28 +258,19 @@ if __name__ == "__main__":
     # Original arguments
     parser.add_argument("-m", "--model", required=True)
     parser.add_argument("-d", "--dataset", type=str)
-    parser.add_argument("-s", "--subset", type=str)
-    parser.add_argument("-f", "--feature", type=str)
-    parser.add_argument("--max-tokens", type=int, default=8192)
-    parser.add_argument("--min-tokens", type=int, default=8192)
-    parser.add_argument("--dataset-min-tokens", type=int)
-    parser.add_argument("--sliding-window", type=int, default=256)
-    parser.add_argument("--truncate", action="store_true")
-    parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--samples", type=int)
-    parser.add_argument("--save-tokenized", type=str)
-    parser.add_argument("--tokenized", type=str)
-    parser.add_argument("--output-file", type=str)
-    parser.add_argument("--use_seer_attn", action="store_true")
-    
+    parser.add_argument("--save_dir", type=str, required=True)
+    parser.add_argument("--use_seer", action="store_true")
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--length", nargs="+", type=int, default=[4096])
+
     # New sparsity parameters
-    parser.add_argument("--sparsity-method", choices=['threshold', 'nz_ratio'], default='threshold')
+    parser.add_argument("--sparsity_method", choices=['threshold', 'nz_ratio'], default='threshold')
     parser.add_argument("--threshold", type=str, default="0.001")
-    parser.add_argument("--nz-ratios", type=str, default="0.5")
-    parser.add_argument("--gate-type", type=str, default="Qavg_Kmaxminavg")
-    parser.add_argument("--random_seed", type=int, default=47)
+    parser.add_argument("--nz_ratios", type=str, default="0.5")
+    parser.add_argument("--gate_type", type=str, default="Qavg_Kmaxminavg")
     
     args = parser.parse_args()
-    torch.manual_seed(args.random_seed)
+    transformers.set_seed(args.seed)
     
     main(args)
