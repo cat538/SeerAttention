@@ -34,8 +34,18 @@ if __name__ == "__main__":
     ppl.add_argument("--batch", type=int, default=1, help="Batch size for evaluation")
     ppl.add_argument("--save_dir", type=str, default=f"{PROJ_ROOT}/eval-out/ppl", help="Path to save results")
 
-    args = parser.parse_args()
-
+    args = parser.parse_args(
+        # [
+        #     "ppl",
+        #     "-m", "qwen2.5-3b",
+        #     "-d", "wiki",
+        #     "--length", "4096",
+        #     "--gate_type", "Qavg_Kmaxminavg",
+        #     "--sp_method", "nz_ratio",
+        #     "--nz_ratios", "0.5",
+        #     "--use_seer",
+        # ]
+    )
     if args.command == "ppl":
         N_GPUS_PER_TASK = 1
         num_device_groups = num_gpus // N_GPUS_PER_TASK
@@ -64,7 +74,7 @@ if __name__ == "__main__":
                 f"--batch {args.batch}",
                 f"--save_dir {args.save_dir}",
                 f"--seed {args.seed}",
-                f"--gate_type {args.gate_type}"
+                f"--gate_type {args.gate_type}",
                 f"--sparsity_method {args.sp_method}",
                 f"--threshold {args.threshold}",
                 f"--nz_ratios {args.nz_ratios}",

@@ -59,6 +59,8 @@ def get_dataset(data_id: str, train_nsamples, seed, seqlen, tokenizer:PreTrained
 
 
 def append_with_lock(filename: str, data: str):
+    if not os.path.exists(os.path.dirname(filename)):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "a") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         fcntl.flock(sys.stdout.fileno(), fcntl.LOCK_EX)
@@ -184,26 +186,28 @@ def compute_perplexity(
 
 
 def main(args):
-    model_path = MODEL_ID2PATH[args.model]
+    model_id = args.model
+    model_seer_path = MODEL_ID2GATE[model_id]
+    model_path = MODEL_ID2PATH[model_id]
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     _, testenc = get_dataset(
         data_id=args.dataset,
-        train_nsamples=args.samples,
+        train_nsamples=128,
         seed=args.seed,
-        seqlen=args.max_tokens,
+        seqlen=4096,
         tokenizer=tokenizer,
-        model_id=args.model,
+        model_id=model_id,
         test_only=True
     )
 
     results = []
     # Model loading with config parameters
     if args.use_seer:
-        if "llama" in model_path.lower():
+        if "llama" in model_seer_path.lower():
             model = SeerAttnLlamaForCausalLM.from_pretrained(
-                model_path,
+                model_seer_path,
                 torch_dtype=torch.bfloat16,
                 device_map='auto',
                 seerattn_sparsity_method=args.sparsity_method,
@@ -212,9 +216,9 @@ def main(args):
                 seerattn_gate_type=args.gate_type,
                 seerattn_last_block_dense=False,
             )
-        elif "qwen" in model_path.lower():
+        elif "qwen" in model_seer_path.lower():
             model = SeerAttnQwen2ForCausalLM.from_pretrained(
-                model_path,
+                model_seer_path,
                 torch_dtype=torch.bfloat16,
                 device_map='auto',
                 seerattn_sparsity_method=args.sparsity_method,
@@ -234,7 +238,7 @@ def main(args):
         )
 
     for seqlen in args.length:
-        save_file = f"{args.save_dir}/{args.model}-{args.dataset}-{seqlen}.jsonl"
+        save_file = f"{args.save_dir}/{model_id}-{args.dataset}-{seqlen}.jsonl"
         if args.use_seer:
             params = (args.threshold.split(",") if args.sparsity_method == 'threshold' 
                         else args.nz_ratios.split(","))
@@ -245,8 +249,7 @@ def main(args):
                     model.config.seerattn_nz_ratio = float(param_val)
                 
                 ppl = eval_ppl(testenc, model, seqlen)
-                param_str = args.nz_ratios if args.sparsity_method == 'threshold' else args.threshold
-                seer_tag = f"seer-{args.sparsity_method}-{param_str}"
+                seer_tag = f"seer-{args.sparsity_method}-{float(param_val):.2f}"
                 append_with_lock(save_file, json.dumps({f"{seer_tag}": f"{ppl:.3f}", "seqlen": seqlen}))
         else:
             ppl = eval_ppl(testenc, model, seqlen)
@@ -270,7 +273,22 @@ if __name__ == "__main__":
     parser.add_argument("--nz_ratios", type=str, default="0.5")
     parser.add_argument("--gate_type", type=str, default="Qavg_Kmaxminavg")
     
-    args = parser.parse_args()
+    args = parser.parse_args(
+        # [
+        #     "--model", "qwen2.5-3b",
+        #     "--dataset", "wiki",
+        #     "--save_dir", "../../eval-out/ppl",
+        #     "--length", "4096",
+        #     "--use_seer",
+        #     "--gate_type", "Qavg_Kmaxminavg",
+        #     "--sparsity_method", "nz_ratio",
+        #     "--nz_ratios", "0.5",
+        # ]
+    )
     transformers.set_seed(args.seed)
+    
+    # import debugpy
+    # debugpy.listen(45678)
+    # debugpy.wait_for_client()
     
     main(args)
