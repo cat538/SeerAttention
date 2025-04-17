@@ -192,6 +192,7 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
+
     _, testenc = get_dataset(
         data_id=args.dataset,
         train_nsamples=128,
@@ -237,6 +238,14 @@ def main(args):
             attn_implementation="flash_attention_2",
         )
 
+    import sys
+    sys.path.append("..")
+    from quant.quantizer import AttnQuantizer
+    attn_quantizer = AttnQuantizer.from_qstr(args.attn_qstr)
+    AttnQuantizer.plug_into_model(attn_quantizer, model.model)
+    qtag = f"_{args.attn_qstr}"
+    if not attn_quantizer.is_quant(): qtag = ""
+    
     for seqlen in args.length:
         save_file = f"{args.save_dir}/{model_id}-{args.dataset}-{seqlen}.jsonl"
         if args.use_seer:
@@ -250,6 +259,7 @@ def main(args):
                 
                 ppl = eval_ppl(testenc, model, seqlen)
                 seer_tag = f"seer-{args.sparsity_method}-{float(param_val):.2f}"
+                seer_tag += qtag
                 append_with_lock(save_file, json.dumps({f"{seer_tag}": f"{ppl:.3f}", "seqlen": seqlen}))
         else:
             ppl = eval_ppl(testenc, model, seqlen)
@@ -272,6 +282,10 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=str, default="0.001")
     parser.add_argument("--nz_ratios", type=str, default="0.5")
     parser.add_argument("--gate_type", type=str, default="Qavg_Kmaxminavg")
+
+    # New quant parameters
+    # e.g. q4_k4_v4_g-1_sym_rtn; qf8_kf8_vf8_g-1_sym_had;
+    parser.add_argument("--attn_qstr", type=str, default="q16_k16_v16_g-1_sym_rtn")
     
     args = parser.parse_args(
         # [

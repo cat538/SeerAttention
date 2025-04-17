@@ -31,6 +31,8 @@ if __name__ == "__main__":
     ppl.add_argument("--nz_ratios", type=str, default="0.5")
     ppl.add_argument("--gate_type", type=str, default="Qavg_Kmaxminavg")
     
+    ppl.add_argument("--attn_qstr", type=str, default="q16_k16_v16_g-1_sym_rtn")
+    
     ppl.add_argument("--batch", type=int, default=1, help="Batch size for evaluation")
     ppl.add_argument("--save_dir", type=str, default=f"{PROJ_ROOT}/eval-out/ppl", help="Path to save results")
 
@@ -79,6 +81,7 @@ if __name__ == "__main__":
                 f"--threshold {args.threshold}",
                 f"--nz_ratios {args.nz_ratios}",
                 f"--use_seer" if args.use_seer else "",
+                f"--attn_qstr {args.attn_qstr}",
             ]
             command_str = " ".join(command)
             print(f"Running command: {command_str}")

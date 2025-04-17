@@ -235,7 +235,13 @@ class SeerAttnQwen2Attention(nn.Module):
 
             else:
                 raise NotImplementedError("The sparsity method is not implemented")
-        
+
+            if getattr(self, "quantizer", None) is not None:
+                quantizer = getattr(self, "quantizer", None)
+                query_states, _, _ = quantizer.fake_quant(query_states, "q")
+                key_states, _, _ = quantizer.fake_quant(key_states, "k")
+                value_states, _, _ = quantizer.fake_quant(value_states, "v")
+
             attn_output = self.attn_func(
                 query_states,
                 key_states,
